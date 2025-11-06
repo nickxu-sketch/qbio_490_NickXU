@@ -1,0 +1,257 @@
+---
+title: "Intro to Epigenomics"
+author: "Wade Boohar"
+date: "11/03/24"
+updated: 03/07/24
+---
+
+
+```{r setup}
+ knitr::opts_knit$set(root.dir = normalizePath("/home1/nickxu/490_cluster/analysis_data"))
+```
+
+Package Download and Data-cleaning
+```{r}
+if (!require("sesameData", quietly = TRUE))
+BiocManager::install("sesameData")
+
+if (!require("sesame", quietly = TRUE))
+BiocManager::install("sesame")
+
+if (!require("limma", quietly = TRUE))
+BiocManager::install("limma")
+```
+
+
+Load in all necessary packages
+```{r}
+library(TCGAbiolinks)
+library(sesame)
+library(sesameData)
+library(limma)
+library(BiocManager)
+library(maftools)
+library(dplyr)
+```
+
+```{r}
+methylation_clinical <- read.csv("/project/rohs_1070/analysis_data/brca_methylation_clinical.csv", row.names = 1)
+
+cpg_sites <- read.csv("/project/rohs_1070/analysis_data/brca_cpg_sites.csv", row.names = 1)
+
+
+#install.packages("data.table")
+library(data.table)
+
+betas <- fread('/project/rohs_1070/analysis_data/brca_methylation_betas.csv', showProgress = TRUE)
+
+betas <- as.data.frame(betas)
+rownames(betas) <- betas[[1]]
+betas[[1]] <- NULL
+```
+
+
+(1) Naive Differential Methylation
+```{r}
+#masking out NAs
+na_mask <- !is.na(methylation_clinical$age_at_diagnosis)
+methylation_clinical <- methylation_clinical[na_mask,]
+betas_clean <- betas[,na_mask]
+
+median <- median(methylation_clinical$age_at_diagnosis)
+
+methylation_clinical$age_category <- ifelse(methylation_clinical$age_at_diagnosis >= median, "old", "young")
+
+#fitting linear models using a "target value"
+young_mask <- methylation_clinical$age_category == "young"
+
+methylation_clinical$ages <- young_mask
+
+mval <- t(apply(betas_clean, 1, function(x) log2(x/(1-x)))) 
+#mvalue is another statistic for methylation, centered at 0 and ranges from -1 to 1
+
+design <- model.matrix(~ages, data = methylation_clinical)
+fit <- lmFit(mval, design)
+fit2 <- eBayes(fit)
+```
+
+```{r}
+#Extracting model into dataframe
+dat <- data.frame(foldchange = fit[["coefficients"]][,2], logPvalue =  -log10(p.adjust(fit2[["p.value"]][,2],method='BY')), geneName = cpg_sites$gene)
+dat$threshold <- as.factor(abs(dat$foldchange) < 1)
+
+#Visualization
+library(ggplot2)
+cols <- c("TRUE" = "grey", "FALSE" = "blue")
+ggplot(data=dat, aes(x=foldchange, y = logPvalue, color=threshold)) +
+  geom_point(alpha=.2, size=0.6) +
+  scale_colour_manual(values = cols) +
+  geom_vline(xintercept = 1, colour="#990000", linetype="dashed") + 
+  geom_vline(xintercept = - 1, colour="#990000", linetype="dashed") +
+  geom_hline(yintercept = 2, colour = "#990000", linetype="dashed") +
+  theme(legend.position="none") +
+  xlab("Fold Change") +
+  ylab("-log10 p value") +
+  theme_bw() +
+  theme(legend.position = "none")
+ggsave("/home1/nickxu/490_cluster/Week08_Epigenomics/Part_1.png")
+```
+Analysis:
+This volcano plot depicts CpG methylation differences between metastatic and non-metastatic TCGA-BRCA patients without adjusting for other clinical variables. Only some CpG sites are hypomethylate in metastatic patients.The volcano plot indicates that the difference in methylation between metastatic and non-metastatic is limited. But the lack of confounders may let the result be less representative.
+
+(2) Direct comparison of methylation status to transcriptional activity
+
+#...INSERT DESeq2 Stuff here to generate 'results'...
+```{r}
+library(readr)
+brca_rna_gene_data <- read_csv("brca_rna_gene_data.csv")
+brca_rna_count_data <- read_csv("brca_rna_count_data.csv")
+brca_rna_clinical_data <- read_csv("brca_rna_clinical_data.csv")
+
+rna_clinical$definition<- factor(rna_clinical$definition)
+
+rna_clinical$age_years <- suppressWarnings(as.numeric(rna_clinical$age_at_diagnosis))/365.25
+
+rna_clinical$age_group <- ifelse(
+  is.na(rna_clinical$age_years), NA_character_,
+  ifelse(rna_clinical$age_years > 50, "old",
+  ifelse(rna_clinical$age_years < 50, "young", NA_character_)
+  ))
+  
+rna_clinical$age_group <- factor(rna_clinical$age_group, levels = c("young","old"))
+
+table(rna_clinical$age_group, useNA = "ifany")
+
+rna_clinical <- rna_clinical[!is.na(rna_clinical$definition) & !is.na(rna_clinical$age_group),
+                             , drop = FALSE]
+
+keep_genes <- rowSums(rna_counts, na.rm = TRUE) >= 20
+filtered_rna_counts <- as.matrix(rna_counts[keep_genes, ])
+
+S_counts   <- ncol(filtered_rna_counts)
+S_clinical <- nrow(rna_clinical)
+cat(S_counts, S_clinical, "\n")
+
+common <- intersect(colnames(filtered_rna_counts), rownames(rna_clinical))
+length(common)
+
+filtered_rna_counts <- filtered_rna_counts[, common, drop = FALSE]
+rna_clinical        <- rna_clinical[common, , drop = FALSE]
+
+stopifnot(ncol(filtered_rna_counts) == nrow(rna_clinical))
+stopifnot(isTRUE(all.equal(colnames(filtered_rna_counts), rownames(rna_clinical))))
+
+library(DESeq2)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = filtered_rna_counts,
+  colData   = rna_clinical,
+  design    = ~ age_group + definition
+)
+
+```
+
+```{r}
+library(progressr)
+with_progress({
+  p <- progressor(steps = 3)
+
+  p(message = "Estimating size factors…")
+  dds <- estimateSizeFactors(dds)
+
+  p(message = "Estimating dispersions…")
+  dds <- estimateDispersions(dds, quiet = FALSE)
+
+  p(message = "Fitting GLMs / Wald tests…")
+  dds <- nbinomWaldTest(dds, betaPrior = FALSE, quiet = FALSE)
+})
+
+dds_obj <- DESeq(dds)
+
+resultsNames(dds_obj)
+
+results <- results(
+  dds_obj,
+  format   = "DataFrame",
+  contrast = c("definition", "Primary solid Tumor", "Solid Tissue Normal")
+)
+
+results <- data.frame(results)
+
+results_sig <- subset(results,
+                      !is.na(padj) &
+                      padj < 0.05 &
+                      abs(log2FoldChange) >= 1)
+
+```
+
+
+```{r}
+ens <- sub("\\..*$", "", rownames(results))
+install.packages(org.Hs.eg.db)
+suppressPackageStartupMessages({
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+})
+
+map <- AnnotationDbi::select(org.Hs.eg.db,
+                             keys    = unique(ens),
+                             keytype = "ENSEMBL",
+                             columns = "SYMBOL")
+sym_lookup <- setNames(map$SYMBOL, map$ENSEMBL)
+
+results$gene_name <- sym_lookup[ens]
+missing <- is.na(results$gene_name)
+results$gene_name[missing] <- ens[missing]
+
+results$`-log10(padj)` <- -log10(results$padj)
+results$`-log10(padj)`[!is.finite(results$`-log10(padj)`)]<- NA_real_
+
+```
+
+```{r}
+library(EnhancedVolcano)
+EnhancedVolcano(results,
+                lab = results$gene_name,
+                x = 'log2FoldChange',
+                y = 'padj',
+                title = 'Sample Definition: Tumor vs Normal Tissue',
+                pointSize = 1.0,
+                labSize = 5.0)
+ggsave("/home1/nickxu/490_cluster/Week08_Epigenomics/Part_2.png")
+```
+
+```{r}
+#you can also try looking at "upregulated" or "hypermethylated" !
+downregulated <- results[(results$log2FoldChange < 3), 'gene_name']
+hypomethylated <- dat[dat$foldchange < -1, 'geneName']
+interest_genes <- intersect(downregulated, hypomethylated)
+```
+
+Analysis:
+Through the volcano plot and analysis to methylation data, we find that  genes show significant up- or down-regulation through the great differennce in transcriptional activity between these two clinical groups.We find that genes including TSPAN6, TNMD, and CFH were found to be downregulated at the transcriptional level, while several such as KCNA3, SLC30A10, and MCF2L2 were hypomethylated.The intersection of these two datasets show both reduced methylation and decreased expression,suggesting potential epigenetic regulation in metastatic tumors.
+
+(Extra) Making Boxplots
+```{r}
+GENE<-"GIPR"
+
+gene_counts_mask <- rna_genes$gene_name == GENE
+gene_betas_mask <- cpg_sites$gene == GENE
+
+rna_clinical_tumor <- rna_clinical$definition == "Primary solid Tumor"
+methylation_clinical_tumor <- methylation_clinical$definition == "Primary solid Tumor"
+
+rna_clinical_normal <- rna_clinical$definition == "Solid Tissue Normal"
+methylation_clinical_normal <- methylation_clinical$definition == "Solid Tissue Normal"
+
+rna_tumor <- as.numeric(rna_counts[gene_counts_mask, rna_clinical_tumor])
+methylation_tumor <- (betas[gene_betas_mask, methylation_clinical_tumor])
+
+rna_normal <- as.numeric(rna_counts[gene_counts_mask, rna_clinical_normal])
+methylation_normal <- (betas[gene_betas_mask, methylation_clinical_normal])
+```
+
+```{r}
+boxplot(rna_normal, rna_tumor, xlab='Group', ylab='Counts', names=c('Normal', 'Tumor'))
+```
+
